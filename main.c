@@ -4,7 +4,6 @@
 #include <Windows.h>
 #include <winternl.h>
 
-#include <stdint.h>
 #include <stdio.h>
 
 #pragma comment(lib, "ws2_32.lib")
@@ -15,7 +14,6 @@
 #define LISTEN_PORT     10080
 #define BUF_SIZE        4096
 #define BATCH_SIZE      64
-#define MAX_CONNECTIONS 65536
 
 #define FIBER_STACK_SIZE (256 * 1024) // 256 KB
 
@@ -47,16 +45,15 @@ typedef struct {
 	BOOL   bRunning;
 	SOCKET listenSocket;
 	HANDLE hIOCP;
-	int    activeConns;
+	DWORD  activeConns;
 } Server;
 
-// Per-connection context (lives for the lifetime of one client)
 typedef struct {
 	Server*  serverContext;
 	SOCKET   clientSock;
 	WCHAR    remoteHost[64];
-	char     recvBuf[BUF_SIZE];
-	char     sendBuf[BUF_SIZE];
+	CHAR     recvBuf[BUF_SIZE];
+	CHAR     sendBuf[BUF_SIZE];
 	DWORD    recvBytes;
 } ClientContext;
 
@@ -262,12 +259,6 @@ void WINAPI AcceptLoop(LPVOID param) {
 			continue;
 		}
 
-		if (server->activeConns >= MAX_CONNECTIONS) {
-			printf("[AcceptLoop] Too many connections, dropping client..\n");
-			closesocket(clientSock);
-			continue;
-		}
-
 		// Associate the new socket with IOCP
 		CreateIoCompletionPort((HANDLE)clientSock, server->hIOCP, 0, 0);
 
@@ -401,7 +392,8 @@ BOOL WINAPI CtrlHandler(DWORD dwCtrlType) {
 			g_server->bRunning = FALSE;
 			PostQueuedCompletionStatus(g_server->hIOCP, 0, KEY_SHUTDOWN, NULL);
 		}
-		return TRUE; // suppress default termination
+		// suppress default termination
+		return TRUE;
 	}
 	return FALSE;
 }
