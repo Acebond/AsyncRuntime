@@ -18,6 +18,13 @@
 #define MAX_CONNECTIONS 64
 
 typedef enum {
+	KEY_IO,
+	KEY_START,
+	KEY_CLEANUP,
+	KEY_SHUTDOWN,
+} OpKey;
+
+typedef enum {
 	OP_ACCEPT,
 	OP_RECV,
 	OP_SEND,
@@ -202,7 +209,7 @@ void WINAPI HandleClient(LPVOID param)
 	g_activeConns--;
 
 	// Signal the scheduler that this fiber is done
-	PostQueuedCompletionStatus(g_hIOCP, 0, (ULONG_PTR)GetCurrentFiber(), NULL);
+	PostQueuedCompletionStatus(g_hIOCP, 0, (ULONG_PTR)KEY_CLEANUP, GetCurrentFiber());
 
 	// Idle — scheduler will never switch back here
 	while (1) SwitchToFiber(g_schedulerFiber);
@@ -256,7 +263,8 @@ void WINAPI AcceptLoop(LPVOID param)
 			(UINT64)clientSock, g_activeConns);
 
 		// Kick off the connection fiber — it will immediately block on asyncRecv
-		SwitchToFiber(fiber);
+		PostQueuedCompletionStatus(g_hIOCP, 0, KEY_START, (OVERLAPPED*)fiber);
+		//SwitchToFiber(fiber);
 	}
 }
 
@@ -324,28 +332,32 @@ void SchedulerLoop(void) {
 			break;
 		}
 
-		for (ULONG i = 0; g_bRunning && (i < ulNumEntries); i++) 
-		{
+		for (ULONG i = 0; g_bRunning && (i < ulNumEntries); i++) {
+
 			OVERLAPPED_ENTRY* e = &entries[i];
 
-			if (e->lpOverlapped == NULL) {
-				// Sentinel posted by a finished connection fiber
-				if (e->lpCompletionKey == SHUTDOWN_KEY) {
-					printf("[scheduler] shutdown signal received\n");
-					return;
-				}
-				if (e->lpCompletionKey != 0) {
-					DeleteFiber((LPVOID)e->lpCompletionKey);
-					printf("[scheduler] fiber deleted (active: %d)\n", g_activeConns);
-				}
-				continue;
-			}
+			switch (e->lpCompletionKey) {
 
-			// Normal I/O completion
-			AsyncOp* op = (AsyncOp*)e->lpOverlapped;
-			op->bytes = e->dwNumberOfBytesTransferred;
-			op->error = ERROR_SUCCESS;
-			SwitchToFiber(op->fiber);
+			case KEY_SHUTDOWN:
+				printf("[scheduler] shutdown signal received\n");
+				return;
+
+			case KEY_START:
+				SwitchToFiber((LPVOID)e->lpOverlapped);
+				break;
+
+			case KEY_CLEANUP:
+				DeleteFiber((LPVOID)e->lpOverlapped);
+				printf("[scheduler] fiber deleted (active: %d)\n", g_activeConns);
+				break;
+
+			default:
+				// Normal I/O completion
+				AsyncOp* op = (AsyncOp*)e->lpOverlapped;
+				op->bytes = e->dwNumberOfBytesTransferred;
+				op->error = ERROR_SUCCESS;
+				SwitchToFiber(op->fiber);
+			}
 		}
 	}
 }
@@ -416,8 +428,10 @@ int main(void) {
 		printf("CreateFiber failed\n");
 		return 1;
 	}
+
+	PostQueuedCompletionStatus(g_hIOCP, 0, KEY_START, (OVERLAPPED*)acceptFiber);
 	// acceptFiber runs until it hits awaitOp, then returns here
-	SwitchToFiber(acceptFiber);
+	//SwitchToFiber(acceptFiber);
 
 	//printf("Server is listening on port %d\n", LISTEN_PORT);
 	
