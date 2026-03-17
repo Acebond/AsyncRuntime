@@ -64,20 +64,21 @@ LPFN_ACCEPTEX             fnAcceptEx             = NULL;
 LPFN_GETACCEPTEXSOCKADDRS fnGetAcceptExSockaddrs = NULL;
 LPFN_CONNECTEX            fnConnectEx            = NULL;
 
-LPVOID g_schedulerFiber = NULL;
+// Needed for custom scheduler of userlands threads
+static LPVOID g_schedulerFiber = NULL;
 
-// ---------------------------------------------------------------------------
+// Needed for SetConsoleCtrlHandler and to process the OS signals
+static Server* g_server = NULL;
+
 // awaitOp — the "await" primitive
 // Stores the current fiber in the op, suspends back to the scheduler.
 // Execution resumes here once IOCP signals completion.
-// ---------------------------------------------------------------------------
 inline void awaitOp(AsyncOp* op) {
 	op->fiber = GetCurrentFiber();
 	SwitchToFiber(g_schedulerFiber);
 	// << resumes here after IOCP fires >>
 }
 
-// Issue WSARecv and await its completion.
 int AsyncRecv(SOCKET sock, char* buf, int len, DWORD* bytesRecv) 
 {
 	AsyncOp op = { 
@@ -103,7 +104,6 @@ int AsyncRecv(SOCKET sock, char* buf, int len, DWORD* bytesRecv)
 	return (op.error == ERROR_SUCCESS) ? 0 : SOCKET_ERROR;
 }
 
-// Issue WSASend and await its completion.
 int AsyncSend(SOCKET sock, const char* buf, int len) 
 {
 	AsyncOp op = {
@@ -355,12 +355,8 @@ void SchedulerLoop(Server* server) {
 	while (server->bRunning) {
 
 		BOOL ok = GetQueuedCompletionStatusEx(
-			server->hIOCP,
-			entries,
-			BATCH_SIZE,
-			&ulNumEntries,
-			INFINITE,
-			FALSE);
+			server->hIOCP, entries, BATCH_SIZE, &ulNumEntries,
+			INFINITE, FALSE);
 
 		if (!ok) {
 			LOG_ERROR("GetQueuedCompletionStatusEx");
@@ -377,11 +373,11 @@ void SchedulerLoop(Server* server) {
 				return;
 
 			case KEY_START:
-				SwitchToFiber((LPVOID)e->lpOverlapped);
+				SwitchToFiber(e->lpOverlapped);
 				break;
 
 			case KEY_CLEANUP:
-				DeleteFiber((LPVOID)e->lpOverlapped);
+				DeleteFiber(e->lpOverlapped);
 				break;
 
 			default:
@@ -394,6 +390,20 @@ void SchedulerLoop(Server* server) {
 			}
 		}
 	}
+}
+
+BOOL WINAPI CtrlHandler(DWORD dwCtrlType) {
+	switch (dwCtrlType) {
+	case CTRL_C_EVENT:
+	case CTRL_BREAK_EVENT:
+	case CTRL_CLOSE_EVENT:
+		if (g_server) {
+			g_server->bRunning = FALSE;
+			PostQueuedCompletionStatus(g_server->hIOCP, 0, KEY_SHUTDOWN, NULL);
+		}
+		return TRUE; // suppress default termination
+	}
+	return FALSE;
 }
 
 int main(void) {
@@ -469,8 +479,13 @@ int main(void) {
 		return 1;
 	}
 
+	g_server = &server;
+	SetConsoleCtrlHandler(CtrlHandler, TRUE);
+
 	PostQueuedCompletionStatus(server.hIOCP, 0, KEY_START, acceptFiber);
 	SchedulerLoop(&server);
+
+	printf("Shutting down\n");
 
 	// Clean up
 	CloseHandle(server.hIOCP);
