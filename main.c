@@ -2,11 +2,13 @@
 #include <WinSock2.h>
 #include <MSWSock.h>
 #include <Windows.h>
+#include <winternl.h>
 
 #include <stdint.h>
 #include <stdio.h>
 
 #pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "ntdll.lib")
 
 #define ArraySize(x) (sizeof x / sizeof x[0])
 
@@ -52,6 +54,7 @@ typedef struct {
 typedef struct {
 	Server*  serverContext;
 	SOCKET   clientSock;
+	WCHAR    remoteHost[64];
 	char     recvBuf[BUF_SIZE];
 	char     sendBuf[BUF_SIZE];
 	DWORD    recvBytes;
@@ -203,7 +206,7 @@ void WINAPI HandleClient(LPVOID param) {
 	SOCKET         clientSocket  = clientContext->clientSock;
 	Server*        server        = clientContext->serverContext;
 	
-	printf("[Conn %llu] Connected\n", (UINT64)clientSocket);
+	printf("[%ls] Connected (active: %d)\n", clientContext->remoteHost, server->activeConns);
 
 	while (1) {
 		DWORD bytesRecv = 0;
@@ -214,24 +217,25 @@ void WINAPI HandleClient(LPVOID param) {
 			break;
 		}
 
-		printf("[Conn %llu] Recv %lu bytes\n", (UINT64)clientSocket, bytesRecv);
+		printf("[%ls] Received %lu bytes\n", clientContext->remoteHost, bytesRecv);
 
 		// Echo back
 		memcpy(clientContext->sendBuf, clientContext->recvBuf, bytesRecv);
 
 		rc = AsyncSend(clientSocket, clientContext->sendBuf, (int)bytesRecv);
 		if (rc == SOCKET_ERROR) {
-			printf("[Conn %llu] Send error\n", (UINT64)clientSocket);
 			break;
 		}
+
+		printf("[%ls] Sent %lu bytes\n", clientContext->remoteHost, bytesRecv);
 	}
 
-	printf("[Conn %llu] Closing\n", (UINT64)clientSocket);
+	server->activeConns--;
+
+	printf("[%ls] Disconnected (active: %d)\n", clientContext->remoteHost, server->activeConns);
 	closesocket(clientSocket);
 	HeapFree(GetProcessHeap(), 0, clientContext);
 	
-	server->activeConns--;
-
 	// Signal the scheduler that this fiber is done
 	PostQueuedCompletionStatus(server->hIOCP, 0, KEY_CLEANUP, GetCurrentFiber());
 
@@ -247,7 +251,11 @@ void WINAPI AcceptLoop(LPVOID param) {
 
 	while (1) {
 
-		SOCKET clientSock = AsyncAccept(server->listenSocket, NULL, NULL);
+		SOCKADDR_IN remoteAddr    = { 0 };
+		int         remoteAddrLen = sizeof(remoteAddr);
+
+		SOCKET clientSock = AsyncAccept(server->listenSocket, 
+			(SOCKADDR*)&remoteAddr, &remoteAddrLen);
 
 		if (clientSock == INVALID_SOCKET) {
 			printf("[AcceptLoop] AsyncAccept failed, retrying...\n");
@@ -271,6 +279,11 @@ void WINAPI AcceptLoop(LPVOID param) {
 			closesocket(clientSock);
 			continue;
 		}
+
+		// Convert remote address to a human-readable string
+		DWORD remoteHostLen = ArraySize(clientContext->remoteHost);
+		WSAAddressToStringW((SOCKADDR*)&remoteAddr, remoteAddrLen,
+			NULL, clientContext->remoteHost, &remoteHostLen);
 
 		clientContext->serverContext = server;
 		clientContext->clientSock    = clientSock;
@@ -344,7 +357,7 @@ void SchedulerLoop(Server* server) {
 		BOOL ok = GetQueuedCompletionStatusEx(
 			server->hIOCP,
 			entries,
-			ArraySize(entries),
+			BATCH_SIZE,
 			&ulNumEntries,
 			INFINITE,
 			FALSE);
@@ -361,7 +374,6 @@ void SchedulerLoop(Server* server) {
 			switch (e->lpCompletionKey) {
 
 			case KEY_SHUTDOWN:
-				printf("[Scheduler] Shutdown signal received\n");
 				return;
 
 			case KEY_START:
@@ -370,14 +382,13 @@ void SchedulerLoop(Server* server) {
 
 			case KEY_CLEANUP:
 				DeleteFiber((LPVOID)e->lpOverlapped);
-				printf("[Scheduler] fiber deleted (active: %d)\n", server->activeConns);
 				break;
 
 			default:
 				// Normal I/O completion
 				AsyncOp* op = (AsyncOp*)e->lpOverlapped;
 				op->bytes = e->dwNumberOfBytesTransferred;
-				op->error = ERROR_SUCCESS;
+				op->error = RtlNtStatusToDosError((NTSTATUS)op->ov.Internal);
 				SwitchToFiber(op->fiber);
 				break;
 			}
