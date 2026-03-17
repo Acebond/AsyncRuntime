@@ -17,7 +17,7 @@
 
 #define FIBER_STACK_SIZE (256 * 1024) // 256 KB
 
-#define LOG_ERROR_CODE(func, code) printf("[" __FUNCTION__ "] " #func " failed with error: %lu\n", code)
+#define LOG_ERROR_CODE(func, code) printf("[" __FUNCTION__ "] " func " failed with error: %lu\n", code)
 #define LOG_ERROR(func) LOG_ERROR_CODE(func, GetLastError())
 
 typedef enum {
