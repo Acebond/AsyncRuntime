@@ -10,12 +10,12 @@
 
 #define ArraySize(x) (sizeof x / sizeof x[0])
 
-#define LISTEN_PORT 10080
-#define FIBER_STACK (256 * 1024) // 256 KB
-#define BUF_SIZE    4096
-#define BATCH_SIZE   64
-#define SHUTDOWN_KEY 0xDEAD
+#define LISTEN_PORT     10080
+#define BUF_SIZE        4096
+#define BATCH_SIZE      64
 #define MAX_CONNECTIONS 64
+
+#define FIBER_STACK_SIZE (256 * 1024) // 256 KB
 
 typedef enum {
 	KEY_IO,
@@ -31,7 +31,7 @@ typedef enum {
 } OpType;
 
 typedef struct {
-	OVERLAPPED ov;       // First: IOCP returns a pointer to this
+	OVERLAPPED ov;       // IOCP returns a pointer to this
 	LPVOID     fiber;    // Fiber to resume on completion
 	DWORD      bytes;    // Bytes transferred
 	DWORD      error;    // Win32 error code
@@ -140,9 +140,9 @@ BOOL AsyncAccept(SOCKET listenSock, SOCKET* outClientSock) {
 		listenSock,
 		clientSock,
 		addrBuf,
-		0,                                        // receive 0 bytes of data
-		sizeof(struct sockaddr_in) + 16,          // local addr size
-		sizeof(struct sockaddr_in) + 16,          // remote addr size
+		0,                                 // receive 0 bytes of data
+		sizeof(SOCKADDR_IN) + 16,          // local addr size
+		sizeof(SOCKADDR_IN) + 16,          // remote addr size
 		&bytesReceived,
 		&op.ov);
 
@@ -152,7 +152,8 @@ BOOL AsyncAccept(SOCKET listenSock, SOCKET* outClientSock) {
 		return FALSE;
 	}
 
-	awaitOp(&op);   // <-- AWAIT: suspend until a client connects
+	// suspend until a client connects
+	awaitOp(&op);
 
 	if (op.error != ERROR_SUCCESS) {
 		printf("[accept] completion error: %lu\n", op.error);
@@ -168,16 +169,12 @@ BOOL AsyncAccept(SOCKET listenSock, SOCKET* outClientSock) {
 	return TRUE;
 }
 
-// ---------------------------------------------------------------------------
-// Connection fiber — one per accepted client
-// Reads until the client closes, echoes every chunk back.
-// ---------------------------------------------------------------------------
 void WINAPI HandleClient(LPVOID param) 
 {
 	ConnCtx* ctx = (ConnCtx*)param;
 	SOCKET   sock = ctx->clientSock;
 
-	printf("[conn] client connected (socket %llu)\n", (UINT64)sock);
+	printf("[Conn %llu] Client connected\n", (UINT64)sock);
 
 	while (1) {
 		DWORD bytesRecv = 0;
@@ -189,7 +186,7 @@ void WINAPI HandleClient(LPVOID param)
 		}
 
 		ctx->recvBuf[bytesRecv] = '\0';
-		printf("[conn %llu] recv %lu bytes: %.*s",
+		printf("[Conn %llu] Recv %lu bytes: %.*s",
 			(UINT64)sock, bytesRecv,
 			(int)bytesRecv, ctx->recvBuf);
 
@@ -197,12 +194,12 @@ void WINAPI HandleClient(LPVOID param)
 		memcpy(ctx->sendBuf, ctx->recvBuf, bytesRecv);
 		rc = AsyncSend(sock, ctx->sendBuf, (int)bytesRecv);
 		if (rc == SOCKET_ERROR) {
-			printf("[conn %llu] send error\n", (UINT64)sock);
+			printf("[Conn %llu] Send error\n", (UINT64)sock);
 			break;
 		}
 	}
 
-	printf("[conn %llu] closing\n", (UINT64)sock);
+	printf("[Conn %llu] Closing\n", (UINT64)sock);
 	closesocket(sock);
 	HeapFree(GetProcessHeap(), 0, ctx);
 	
@@ -241,7 +238,7 @@ void WINAPI AcceptLoop(LPVOID param)
 		}
 
 		// Associate the new socket with IOCP so its recv/send ops complete here
-		CreateIoCompletionPort((HANDLE)clientSock, g_hIOCP, (ULONG_PTR)clientSock, 0);
+		CreateIoCompletionPort((HANDLE)clientSock, g_hIOCP, 0, 0);
 
 		// Allocate a context and spawn a fiber for this connection
 		ConnCtx* ctx = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(ConnCtx));
@@ -251,7 +248,7 @@ void WINAPI AcceptLoop(LPVOID param)
 		}
 		ctx->clientSock = clientSock;
 
-		LPVOID fiber = CreateFiber(FIBER_STACK, HandleClient, ctx);
+		LPVOID fiber = CreateFiber(FIBER_STACK_SIZE, HandleClient, ctx);
 		if (!fiber) {
 			HeapFree(GetProcessHeap(), 0, ctx);
 			closesocket(clientSock);
@@ -264,7 +261,6 @@ void WINAPI AcceptLoop(LPVOID param)
 
 		// Kick off the connection fiber — it will immediately block on asyncRecv
 		PostQueuedCompletionStatus(g_hIOCP, 0, KEY_START, (OVERLAPPED*)fiber);
-		//SwitchToFiber(fiber);
 	}
 }
 
@@ -339,7 +335,7 @@ void SchedulerLoop(void) {
 			switch (e->lpCompletionKey) {
 
 			case KEY_SHUTDOWN:
-				printf("[scheduler] shutdown signal received\n");
+				printf("[Scheduler] Shutdown signal received\n");
 				return;
 
 			case KEY_START:
@@ -348,7 +344,7 @@ void SchedulerLoop(void) {
 
 			case KEY_CLEANUP:
 				DeleteFiber((LPVOID)e->lpOverlapped);
-				printf("[scheduler] fiber deleted (active: %d)\n", g_activeConns);
+				printf("[Scheduler] fiber deleted (active: %d)\n", g_activeConns);
 				break;
 
 			default:
@@ -357,6 +353,7 @@ void SchedulerLoop(void) {
 				op->bytes = e->dwNumberOfBytesTransferred;
 				op->error = ERROR_SUCCESS;
 				SwitchToFiber(op->fiber);
+				break;
 			}
 		}
 	}
@@ -375,7 +372,7 @@ int main(void) {
 	// Creates a socket that is bound to a specific transport service provider
 	g_listenSocket = WSASocket(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0, WSA_FLAG_OVERLAPPED);
 	if (g_listenSocket == INVALID_SOCKET) {
-		printf("WSASocket failed with error: %d\n", WSAGetLastError());
+		printf("WSASocket error: %d\n", WSAGetLastError());
 		return 1;
 	}
 
@@ -390,13 +387,13 @@ int main(void) {
 
 	// Associates a local address with a socket
 	if (bind(g_listenSocket, (SOCKADDR*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR) {
-		printf("bind failed with error: %d\n", WSAGetLastError());
+		printf("bind error: %d\n", WSAGetLastError());
 		return 1;
 	}
 
 	// Places a socket in a state in which it is listening for an incoming connection
 	if (listen(g_listenSocket, SOMAXCONN) == SOCKET_ERROR) {
-		printf("listen failed with error: %d\n", WSAGetLastError());
+		printf("listen error: %d\n", WSAGetLastError());
 		return 1;
 	}
 
@@ -409,42 +406,33 @@ int main(void) {
 	// NumberOfConcurrentThreads = 1 (for now)
 	g_hIOCP = CreateIoCompletionPort((HANDLE)g_listenSocket, NULL, (ULONG_PTR)g_listenSocket, 1);
 	if (g_hIOCP == NULL) {
-		printf("CreateIoCompletionPort failed with error: %lu\n", GetLastError());
+		printf("CreateIoCompletionPort error: %lu\n", GetLastError());
 		return 1;
 	}
 
 	// Convert main thread to a fiber (required before using fibers)
 	g_schedulerFiber = ConvertThreadToFiber(NULL);
 	if (!g_schedulerFiber) {
-		printf("ConvertThreadToFiber failed with error: %lu\n", GetLastError());
+		printf("ConvertThreadToFiber error: %lu\n", GetLastError());
 		return 1;
 	}
 
 
 	// Create and kick off the accept fiber
 	// It will call AsyncAccept, which suspends immediately back here
-	LPVOID acceptFiber = CreateFiber(FIBER_STACK, AcceptLoop, NULL);
+	LPVOID acceptFiber = CreateFiber(FIBER_STACK_SIZE, AcceptLoop, NULL);
 	if (!acceptFiber) {
 		printf("CreateFiber failed\n");
 		return 1;
 	}
 
 	PostQueuedCompletionStatus(g_hIOCP, 0, KEY_START, (OVERLAPPED*)acceptFiber);
-	// acceptFiber runs until it hits awaitOp, then returns here
-	//SwitchToFiber(acceptFiber);
-
-	//printf("Server is listening on port %d\n", LISTEN_PORT);
-	
-
-	//printf("Connected!\n");
-
-	//ReadHeader(NULL);
-
 	SchedulerLoop();
 
 	// Clean up
 	CloseHandle(g_hIOCP);
 	closesocket(g_listenSocket);
 	WSACleanup();
+	ConvertFiberToThread();
 	return 0;
 }
