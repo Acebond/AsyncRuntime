@@ -13,9 +13,12 @@
 #define LISTEN_PORT     10080
 #define BUF_SIZE        4096
 #define BATCH_SIZE      64
-#define MAX_CONNECTIONS 64
+#define MAX_CONNECTIONS 65536
 
 #define FIBER_STACK_SIZE (256 * 1024) // 256 KB
+
+#define LOG_ERROR_CODE(func, code) printf("[" __FUNCTION__ "] " #func " failed with error: %lu\n", code)
+#define LOG_ERROR(func) LOG_ERROR_CODE(func, GetLastError())
 
 typedef enum {
 	KEY_IO,
@@ -61,13 +64,13 @@ int    g_activeConns    = 0;
 // Stores the current fiber in the op, suspends back to the scheduler.
 // Execution resumes here once IOCP signals completion.
 // ---------------------------------------------------------------------------
-void awaitOp(AsyncOp* op) {
+inline void awaitOp(AsyncOp* op) {
 	op->fiber = GetCurrentFiber();
 	SwitchToFiber(g_schedulerFiber);
 	// << resumes here after IOCP fires >>
 }
 
-// Issue WSARecv and await its completion
+// Issue WSARecv and await its completion.
 int AsyncRecv(SOCKET sock, char* buf, int len, DWORD* bytesRecv) 
 {
 	AsyncOp op = { 
@@ -116,19 +119,17 @@ int AsyncSend(SOCKET sock, const char* buf, int len)
 	return (op.error == ERROR_SUCCESS) ? 0 : SOCKET_ERROR;
 }
 
-// Issue AcceptEx and await its completion.
-// AcceptEx requires a pre-created socket for the incoming connection and a
-// buffer large enough for two sockaddr_in structs plus 16 bytes each.
-BOOL AsyncAccept(SOCKET listenSock, SOCKET* outClientSock) {
+SOCKET AsyncAccept(SOCKET listenSock) {
+
 	// AcceptEx writes local+remote address into this buffer.
 	// The (+16) is a quirk of AcceptEx — it needs 16 bytes of padding per addr.
-	char addrBuf[2 * (sizeof(struct sockaddr_in) + 16)] = { 0 };
+	char addrBuf[2 * (sizeof(SOCKADDR_IN) + 16)] = { 0 };
 
 	// Pre-create the client socket
 	SOCKET clientSock = WSASocket(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0, WSA_FLAG_OVERLAPPED);
 	if (clientSock == INVALID_SOCKET) {
-		printf("[accept] WSASocket failed: %d\n", WSAGetLastError());
-		return FALSE;
+		LOG_ERROR("WSASocket");
+		return INVALID_SOCKET;
 	}
 
 	AsyncOp op = {
@@ -147,34 +148,33 @@ BOOL AsyncAccept(SOCKET listenSock, SOCKET* outClientSock) {
 		&op.ov);
 
 	if (!ok && WSAGetLastError() != ERROR_IO_PENDING) {
-		printf("[accept] AcceptEx failed: %d\n", WSAGetLastError());
+		LOG_ERROR("AcceptEx");
 		closesocket(clientSock);
-		return FALSE;
+		return INVALID_SOCKET;
 	}
 
 	// suspend until a client connects
 	awaitOp(&op);
 
 	if (op.error != ERROR_SUCCESS) {
-		printf("[accept] completion error: %lu\n", op.error);
+		LOG_ERROR_CODE("AcceptEx", op.error);
 		closesocket(clientSock);
-		return FALSE;
+		return INVALID_SOCKET;
 	}
 
 	// AcceptEx requires this setsockopt so that getpeername() etc. work
 	setsockopt(clientSock, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT,
 		(char*)&listenSock, sizeof(listenSock));
 
-	*outClientSock = clientSock;
-	return TRUE;
+	return clientSock;
 }
 
-void WINAPI HandleClient(LPVOID param) 
-{
+void WINAPI HandleClient(LPVOID param) {
+
 	ConnCtx* ctx = (ConnCtx*)param;
 	SOCKET   sock = ctx->clientSock;
 
-	printf("[Conn %llu] Client connected\n", (UINT64)sock);
+	printf("[Conn %llu] Connected\n", (UINT64)sock);
 
 	while (1) {
 		DWORD bytesRecv = 0;
@@ -185,13 +185,11 @@ void WINAPI HandleClient(LPVOID param)
 			break;
 		}
 
-		ctx->recvBuf[bytesRecv] = '\0';
-		printf("[Conn %llu] Recv %lu bytes: %.*s",
-			(UINT64)sock, bytesRecv,
-			(int)bytesRecv, ctx->recvBuf);
+		printf("[Conn %llu] Recv %lu bytes\n", (UINT64)sock, bytesRecv);
 
-		// Echo back verbatim
+		// Echo back
 		memcpy(ctx->sendBuf, ctx->recvBuf, bytesRecv);
+
 		rc = AsyncSend(sock, ctx->sendBuf, (int)bytesRecv);
 		if (rc == SOCKET_ERROR) {
 			printf("[Conn %llu] Send error\n", (UINT64)sock);
@@ -212,21 +210,17 @@ void WINAPI HandleClient(LPVOID param)
 	while (1) SwitchToFiber(g_schedulerFiber);
 }
 
-// ---------------------------------------------------------------------------
-// Accept fiber — loops forever calling asyncAccept, spawning a new
-// connection fiber for each client that arrives.
-// ---------------------------------------------------------------------------
-void WINAPI AcceptLoop(LPVOID param) 
-{
+void WINAPI AcceptLoop(LPVOID param) {
+
 	UNREFERENCED_PARAMETER(param);
 
 	printf("[AcceptLoop] Listening on port %d\n", LISTEN_PORT);
 
-	while (1) 
-	{
-		SOCKET clientSock = INVALID_SOCKET;
+	while (1) {
 
-		if (!AsyncAccept(g_listenSocket, &clientSock)) {
+		SOCKET clientSock = AsyncAccept(g_listenSocket);
+
+		if (clientSock == INVALID_SOCKET) {
 			printf("[AcceptLoop] AsyncAccept failed, retrying...\n");
 			continue;
 		}
@@ -250,6 +244,7 @@ void WINAPI AcceptLoop(LPVOID param)
 
 		LPVOID fiber = CreateFiber(FIBER_STACK_SIZE, HandleClient, ctx);
 		if (!fiber) {
+			LOG_ERROR("CreateFiber");
 			HeapFree(GetProcessHeap(), 0, ctx);
 			closesocket(clientSock);
 			continue;
@@ -277,7 +272,7 @@ BOOL LoadMSWSockExtensions(SOCKET listenSocket) {
 		&dwBytes, NULL, NULL);
 
 	if (iResult == SOCKET_ERROR) {
-		printf("WSAIoctl failed to load AcceptEx with error: %d\n", WSAGetLastError());
+		LOG_ERROR("WSAIoctl");
 		return FALSE;
 	}
 
@@ -289,7 +284,7 @@ BOOL LoadMSWSockExtensions(SOCKET listenSocket) {
 		&dwBytes, NULL, NULL);
 
 	if (iResult == SOCKET_ERROR) {
-		printf("WSAIoctl failed to load GetAcceptExSockaddrs with error: %d\n", WSAGetLastError());
+		LOG_ERROR("WSAIoctl");
 		return FALSE;
 	}
 
@@ -301,7 +296,7 @@ BOOL LoadMSWSockExtensions(SOCKET listenSocket) {
 		&dwBytes, NULL, NULL);
 
 	if (iResult == SOCKET_ERROR) {
-		printf("WSAIoctl failed to load ConnectEx with error: %d\n", WSAGetLastError());
+		LOG_ERROR("WSAIoctl");
 		return FALSE;
 	}
 
@@ -324,7 +319,7 @@ void SchedulerLoop(void) {
 			FALSE);
 
 		if (!ok) {
-			printf("GetQueuedCompletionStatusEx error: %lu\n", GetLastError());
+			LOG_ERROR("GetQueuedCompletionStatusEx");
 			break;
 		}
 
@@ -361,18 +356,18 @@ void SchedulerLoop(void) {
 
 int main(void) {
 
-	// Initiates the Winsock (Windows Sockets API) DLL.
+	// Initialize Winsock (Windows Sockets API)
 	WSADATA wsaData = { 0 };
 	int err = WSAStartup(MAKEWORD(2, 2), &wsaData);
 	if (err != ERROR_SUCCESS) {
-		printf("WSAStartup failed with error: %d\n", err);
+		LOG_ERROR_CODE("WSAStartup", err);
 		return 1;
 	}
 
 	// Creates a socket that is bound to a specific transport service provider
 	g_listenSocket = WSASocket(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0, WSA_FLAG_OVERLAPPED);
 	if (g_listenSocket == INVALID_SOCKET) {
-		printf("WSASocket error: %d\n", WSAGetLastError());
+		LOG_ERROR("WSASocket");
 		return 1;
 	}
 
@@ -387,13 +382,13 @@ int main(void) {
 
 	// Associates a local address with a socket
 	if (bind(g_listenSocket, (SOCKADDR*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR) {
-		printf("bind error: %d\n", WSAGetLastError());
+		LOG_ERROR("bind");
 		return 1;
 	}
 
 	// Places a socket in a state in which it is listening for an incoming connection
 	if (listen(g_listenSocket, SOMAXCONN) == SOCKET_ERROR) {
-		printf("listen error: %d\n", WSAGetLastError());
+		LOG_ERROR("listen");
 		return 1;
 	}
 
@@ -406,14 +401,14 @@ int main(void) {
 	// NumberOfConcurrentThreads = 1 (for now)
 	g_hIOCP = CreateIoCompletionPort((HANDLE)g_listenSocket, NULL, (ULONG_PTR)g_listenSocket, 1);
 	if (g_hIOCP == NULL) {
-		printf("CreateIoCompletionPort error: %lu\n", GetLastError());
+		LOG_ERROR("CreateIoCompletionPort");
 		return 1;
 	}
 
 	// Convert main thread to a fiber (required before using fibers)
 	g_schedulerFiber = ConvertThreadToFiber(NULL);
 	if (!g_schedulerFiber) {
-		printf("ConvertThreadToFiber error: %lu\n", GetLastError());
+		LOG_ERROR("ConvertThreadToFiber");
 		return 1;
 	}
 
@@ -422,7 +417,7 @@ int main(void) {
 	// It will call AsyncAccept, which suspends immediately back here
 	LPVOID acceptFiber = CreateFiber(FIBER_STACK_SIZE, AcceptLoop, NULL);
 	if (!acceptFiber) {
-		printf("CreateFiber failed\n");
+		LOG_ERROR("CreateFiber");
 		return 1;
 	}
 
