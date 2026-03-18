@@ -181,6 +181,67 @@ SOCKET AsyncAccept(SOCKET listenSocket, SOCKADDR* addr, int* addrlen) {
 	return clientSocket;
 }
 
+SOCKET AsyncConnect(SOCKADDR* remoteAddr, int remoteAddrLen) {
+
+	// ConnectEx requires an overlapped socket
+	SOCKET sock = WSASocket(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0, WSA_FLAG_OVERLAPPED);
+	if (sock == INVALID_SOCKET) {
+		LOG_ERROR("WSASocket");
+		return INVALID_SOCKET;
+	}
+
+	// ConnectEx requires the socket to already be bound
+	// sin_port = 0 so the OS picks an ephemeral port
+	SOCKADDR_IN localAddr     = { 0 };
+	localAddr.sin_family      = AF_INET;
+	localAddr.sin_port        = 0;
+	localAddr.sin_addr.s_addr = INADDR_ANY;
+
+	if (bind(sock, (SOCKADDR*)&localAddr, sizeof(localAddr)) == SOCKET_ERROR) {
+		LOG_ERROR("bind");
+		closesocket(sock);
+		return INVALID_SOCKET;
+	}
+
+	// Associate with the IOCP so completions are delivered to the scheduler
+	if (CreateIoCompletionPort((HANDLE)sock, g_hIOCP, KEY_IO, 0) == NULL) {
+		LOG_ERROR("CreateIoCompletionPort");
+		closesocket(sock);
+		return INVALID_SOCKET;
+	}
+
+	AsyncOp op = { 0 };
+
+	DWORD bytesSent = 0;
+	BOOL ok = fnConnectEx(
+		sock,
+		remoteAddr,
+		remoteAddrLen,
+		NULL, 0,
+		&bytesSent,
+		&op.ov);
+
+	if (!ok && WSAGetLastError() != ERROR_IO_PENDING) {
+		LOG_ERROR("ConnectEx");
+		closesocket(sock);
+		return INVALID_SOCKET;
+	}
+
+	// Suspend until the connection completes (or fails)
+	awaitOp(&op);
+
+	if (op.error != ERROR_SUCCESS) {
+		LOG_ERROR_CODE("ConnectEx", op.error);
+		closesocket(sock);
+		return INVALID_SOCKET;
+	}
+
+	// Required after ConnectEx so that shutdown(), getpeername(), etc. work
+	setsockopt(sock, SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, NULL, 0);
+
+	return sock;
+}
+
 void WINAPI HandleClient(LPVOID param) {
 
 	ClientContext* clientContext = (ClientContext*)param;
