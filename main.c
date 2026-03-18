@@ -14,6 +14,7 @@
 #define LISTEN_PORT     10080
 #define BUF_SIZE        4096
 #define BATCH_SIZE      64
+#define WORKER_THREADS  4
 
 #define ADDR_SIZE (sizeof(SOCKADDR_IN) + 16)
 
@@ -37,14 +38,6 @@ typedef struct {
 } AsyncOp;
 
 typedef struct {
-	BOOL   bRunning;
-	SOCKET listenSocket;
-	HANDLE hIOCP;
-	DWORD  activeConns;
-} Server;
-
-typedef struct {
-	Server*  serverContext;
 	SOCKET   clientSock;
 	WCHAR    remoteHost[64];
 	CHAR     recvBuf[BUF_SIZE];
@@ -60,7 +53,7 @@ LPFN_CONNECTEX            fnConnectEx            = NULL;
 static __declspec(thread) LPVOID tls_schedulerFiber = NULL;
 
 // Needed for SetConsoleCtrlHandler and to process the OS signals
-static Server* g_server = NULL;
+static HANDLE g_hIOCP = NULL;
 
 // awaitOp — the "await" primitive
 // Stores the current fiber in the op, suspends back to the scheduler.
@@ -192,9 +185,8 @@ void WINAPI HandleClient(LPVOID param) {
 
 	ClientContext* clientContext = (ClientContext*)param;
 	SOCKET         clientSocket  = clientContext->clientSock;
-	Server*        server        = clientContext->serverContext;
-	
-	printf("[%ls] Connected (active: %d)\n", clientContext->remoteHost, server->activeConns);
+
+	printf("[%ls] Connected\n", clientContext->remoteHost);
 
 	while (1) {
 		DWORD bytesRecv = 0;
@@ -218,14 +210,12 @@ void WINAPI HandleClient(LPVOID param) {
 		printf("[%ls] Sent %lu bytes\n", clientContext->remoteHost, bytesRecv);
 	}
 
-	server->activeConns--;
-
-	printf("[%ls] Disconnected (active: %d)\n", clientContext->remoteHost, server->activeConns);
+	printf("[%ls] Disconnected\n", clientContext->remoteHost);
 	closesocket(clientSocket);
 	HeapFree(GetProcessHeap(), 0, clientContext);
 	
 	// Signal the scheduler that this fiber is done
-	PostQueuedCompletionStatus(server->hIOCP, 0, KEY_CLEANUP, GetCurrentFiber());
+	PostQueuedCompletionStatus(g_hIOCP, 0, KEY_CLEANUP, GetCurrentFiber());
 
 	// Idle — scheduler will never switch back here
 	while (1) SwitchToFiber(tls_schedulerFiber);
@@ -233,14 +223,14 @@ void WINAPI HandleClient(LPVOID param) {
 
 void WINAPI AcceptLoop(LPVOID param) {
 
-	Server* server = (Server*)param;
+	SOCKET listenSocket = (SOCKET)param;
 
 	while (1) {
 
 		SOCKADDR_IN remoteAddr    = { 0 };
 		int         remoteAddrLen = sizeof(remoteAddr);
 
-		SOCKET clientSocket = AsyncAccept(server->listenSocket, 
+		SOCKET clientSocket = AsyncAccept(listenSocket, 
 			(SOCKADDR*)&remoteAddr, &remoteAddrLen);
 
 		if (clientSocket == INVALID_SOCKET) {
@@ -249,7 +239,7 @@ void WINAPI AcceptLoop(LPVOID param) {
 		}
 
 		// Associate the new socket with IOCP
-		CreateIoCompletionPort((HANDLE)clientSocket, server->hIOCP, KEY_IO, 0);
+		CreateIoCompletionPort((HANDLE)clientSocket, g_hIOCP, KEY_IO, 0);
 
 		// Allocate a context and spawn a fiber for this connection
 		ClientContext* clientContext = HeapAlloc(GetProcessHeap(), 
@@ -265,7 +255,6 @@ void WINAPI AcceptLoop(LPVOID param) {
 		WSAAddressToStringW((SOCKADDR*)&remoteAddr, remoteAddrLen,
 			NULL, clientContext->remoteHost, &remoteHostLen);
 
-		clientContext->serverContext = server;
 		clientContext->clientSock    = clientSocket;
 
 		LPVOID fiber = CreateFiber(FIBER_STACK_SIZE, HandleClient, clientContext);
@@ -276,10 +265,8 @@ void WINAPI AcceptLoop(LPVOID param) {
 			continue;
 		}
 
-		server->activeConns++;
-
 		// Kick off the connection fiber
-		PostQueuedCompletionStatus(server->hIOCP, 0, KEY_START, fiber);
+		PostQueuedCompletionStatus(g_hIOCP, 0, KEY_START, fiber);
 	}
 }
 
@@ -327,29 +314,34 @@ BOOL LoadMSWSockExtensions(SOCKET listenSocket) {
 	return TRUE;
 }
 
-void SchedulerLoop(Server* server) {
+void SchedulerLoop(void) {
 
 	OVERLAPPED_ENTRY entries[BATCH_SIZE];
 	ULONG            ulNumEntries;
 
-	while (server->bRunning) {
+	while (1) {
 
 		BOOL ok = GetQueuedCompletionStatusEx(
-			server->hIOCP, entries, BATCH_SIZE, &ulNumEntries,
-			INFINITE, FALSE);
+			g_hIOCP, 
+			entries, 
+			BATCH_SIZE, 
+			&ulNumEntries,
+			INFINITE, 
+			FALSE);
 
 		if (!ok) {
 			LOG_ERROR("GetQueuedCompletionStatusEx");
 			break;
 		}
 
-		for (ULONG i = 0; server->bRunning && (i < ulNumEntries); i++) {
+		for (ULONG i = 0; i < ulNumEntries; i++) {
 
 			OVERLAPPED_ENTRY* e = &entries[i];
 
 			switch (e->lpCompletionKey) {
 
 			case KEY_SHUTDOWN:
+				PostQueuedCompletionStatus(g_hIOCP, 0, KEY_SHUTDOWN, NULL);
 				return;
 
 			case KEY_START:
@@ -377,24 +369,31 @@ BOOL WINAPI CtrlHandler(DWORD dwCtrlType) {
 	case CTRL_C_EVENT:
 	case CTRL_BREAK_EVENT:
 	case CTRL_CLOSE_EVENT:
-		if (g_server) {
-			g_server->bRunning = FALSE;
-			PostQueuedCompletionStatus(g_server->hIOCP, 0, KEY_SHUTDOWN, NULL);
-		}
+		PostQueuedCompletionStatus(g_hIOCP, 0, KEY_SHUTDOWN, NULL);
 		// suppress default termination
 		return TRUE;
 	}
 	return FALSE;
 }
 
-int main(void) {
+DWORD WINAPI WorkerThread(LPVOID param) {
 
-	Server server = {
-		.bRunning     = TRUE,
-		.listenSocket = INVALID_SOCKET,
-		.hIOCP        = NULL,
-		.activeConns  = 0,
-	};
+	UNREFERENCED_PARAMETER(param);
+
+	// Each worker thread must become a fiber before it can use fibers
+	tls_schedulerFiber = ConvertThreadToFiber(NULL);
+	if (!tls_schedulerFiber) {
+		LOG_ERROR("ConvertThreadToFiber");
+		return 1;
+	}
+
+	SchedulerLoop();
+
+	ConvertFiberToThread();
+	return 0;
+}
+
+int main(void) {
 
 	// Initialize Winsock (Windows Sockets API)
 	WSADATA wsaData = { 0 };
@@ -403,17 +402,17 @@ int main(void) {
 		LOG_ERROR_CODE("WSAStartup", err);
 		return 1;
 	}
-
+	
 	// Creates a socket that is bound to a specific transport service provider
-	server.listenSocket = WSASocket(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0, WSA_FLAG_OVERLAPPED);
-	if (server.listenSocket == INVALID_SOCKET) {
+	SOCKET listenSocket = WSASocket(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0, WSA_FLAG_OVERLAPPED);
+	if (listenSocket == INVALID_SOCKET) {
 		LOG_ERROR("WSASocket");
 		return 1;
 	}
 
 	// Allow address reuse so we can restart quickly
 	BOOL yes = TRUE;
-	setsockopt(server.listenSocket, SOL_SOCKET, SO_REUSEADDR, (char*)&yes, sizeof(yes));
+	setsockopt(listenSocket, SOL_SOCKET, SO_REUSEADDR, (char*)&yes, sizeof(yes));
 
 	SOCKADDR_IN serverAddr     = { 0 };
 	serverAddr.sin_family      = AF_INET;
@@ -421,13 +420,13 @@ int main(void) {
 	serverAddr.sin_addr.s_addr = INADDR_ANY;
 
 	// Associates a local address with a socket
-	if (bind(server.listenSocket, (SOCKADDR*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR) {
+	if (bind(listenSocket, (SOCKADDR*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR) {
 		LOG_ERROR("bind");
 		return 1;
 	}
 
 	// Places a socket in a state in which it is listening for an incoming connection
-	if (listen(server.listenSocket, SOMAXCONN) == SOCKET_ERROR) {
+	if (listen(listenSocket, SOMAXCONN) == SOCKET_ERROR) {
 		LOG_ERROR("listen");
 		return 1;
 	}
@@ -435,45 +434,63 @@ int main(void) {
 	printf("Listening on port %d\n", LISTEN_PORT);
 
 	// Load Microsoft-specific extension to the Windows Sockets specification 
-	if (LoadMSWSockExtensions(server.listenSocket) == FALSE) {
+	if (LoadMSWSockExtensions(listenSocket) == FALSE) {
 		return 1;
 	}
 
 	// Creates an I/O completion port and associate the listening socket with the completion port
 	// NumberOfConcurrentThreads = 1 (for now)
-	server.hIOCP = CreateIoCompletionPort((HANDLE)server.listenSocket, NULL, 0, 1);
-	if (server.hIOCP == NULL) {
+	g_hIOCP = CreateIoCompletionPort((HANDLE)listenSocket, NULL, 0, 1);
+	if (g_hIOCP == NULL) {
 		LOG_ERROR("CreateIoCompletionPort");
 		return 1;
 	}
 
-	// Convert main thread to a fiber (required before using fibers)
-	tls_schedulerFiber = ConvertThreadToFiber(NULL);
-	if (!tls_schedulerFiber) {
-		LOG_ERROR("ConvertThreadToFiber");
-		return 1;
+	// Spin up worker threads — each will convert itself to a fiber and run SchedulerLoop
+	HANDLE threads[WORKER_THREADS] = { NULL };
+
+	for (DWORD i = 0; i < WORKER_THREADS; i++) {
+		threads[i] = CreateThread(NULL, 0, WorkerThread, NULL, 0, NULL);
+		if (!threads[i]) {
+			LOG_ERROR("CreateThread");
+			return 1;
+		}
 	}
+
+	// Convert main thread to a fiber (required before using fibers)
+	//tls_schedulerFiber = ConvertThreadToFiber(NULL);
+	//if (!tls_schedulerFiber) {
+	//	LOG_ERROR("ConvertThreadToFiber");
+	//	return 1;
+	//}
 
 	// Create and kick off the accept fiber
 	// It will call AsyncAccept, which suspends immediately back here
-	LPVOID acceptFiber = CreateFiber(FIBER_STACK_SIZE, AcceptLoop, &server);
+	LPVOID acceptFiber = CreateFiber(FIBER_STACK_SIZE, AcceptLoop, (LPVOID)listenSocket);
 	if (!acceptFiber) {
 		LOG_ERROR("CreateFiber");
 		return 1;
 	}
 
-	g_server = &server;
+	PostQueuedCompletionStatus(g_hIOCP, 0, KEY_START, acceptFiber);
+
 	SetConsoleCtrlHandler(CtrlHandler, TRUE);
 
-	PostQueuedCompletionStatus(server.hIOCP, 0, KEY_START, acceptFiber);
-	SchedulerLoop(&server);
+	WaitForMultipleObjects(WORKER_THREADS, threads, TRUE, INFINITE);
+
+	//SchedulerLoop();
 
 	printf("Shutting down\n");
 
+	for (DWORD i = 0; i < WORKER_THREADS; i++) {
+		CloseHandle(threads[i]);
+	}
+
+
 	// Clean up
-	CloseHandle(server.hIOCP);
-	closesocket(server.listenSocket);
+	CloseHandle(g_hIOCP);
+	closesocket(listenSocket);
 	WSACleanup();
-	ConvertFiberToThread();
+	//ConvertFiberToThread();
 	return 0;
 }
