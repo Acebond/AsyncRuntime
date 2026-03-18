@@ -39,11 +39,14 @@ void HandleClient(SOCKET socket)
 
 int main(void) {
 
+	const WCHAR* host = L"127.0.0.1";
+	const USHORT port = 10080;
+
 	AsyncRuntimeInit(&rt);
 
-	AsyncRuntimeListen(&rt, ":10080", HandleClient);
+	AsyncRuntimeListen(&rt, host, port, HandleClient);
 
-	printf("Listening on port %d\n", LISTEN_PORT);
+	printf("Listening on port %d\n", port);
 
 	// Calls AsyncRuntimeShutdown on Ctrl-C
 	SetConsoleCtrlHandler(CtrlHandler, TRUE);

@@ -1,6 +1,7 @@
 #pragma once
 #define WIN32_LEAN_AND_MEAN
 #include <WinSock2.h>
+#include <WS2tcpip.h>
 #include <MSWSock.h>
 #include <Windows.h>
 #include <winternl.h>
@@ -11,8 +12,6 @@
 #pragma comment(lib, "ntdll.lib")
 
 #define ArraySize(x) (sizeof x / sizeof x[0])
-
-#define LISTEN_PORT     10080
 
 #define BATCH_SIZE      64
 #define WORKER_THREADS  4
@@ -41,10 +40,10 @@ typedef struct {
 } AsyncOp;
 
 typedef struct {
+	HANDLE hIOCP;
 	SOCKET listenSocket;
 	HandleClientFn fnHandleClient;
 	HANDLE threads[WORKER_THREADS];
-	
 } AsyncRuntime;
 
 LPFN_ACCEPTEX             fnAcceptEx             = NULL;
@@ -53,9 +52,6 @@ LPFN_CONNECTEX            fnConnectEx            = NULL;
 
 // Needed for custom scheduler of userlands threads
 static __declspec(thread) LPVOID tls_schedulerFiber = NULL;
-
-// Needed for SetConsoleCtrlHandler and to process the OS signals
-static HANDLE g_hIOCP = NULL;
 
 // awaitOp — the "await" primitive
 // Stores the current fiber in the op, suspends back to the scheduler.
@@ -183,7 +179,7 @@ SOCKET AsyncAccept(SOCKET listenSocket, SOCKADDR* addr, int* addrlen) {
 	return clientSocket;
 }
 
-SOCKET AsyncConnect(SOCKADDR* remoteAddr, int remoteAddrLen) {
+SOCKET AsyncConnect(AsyncRuntime* rt, SOCKADDR* remoteAddr, int remoteAddrLen) {
 
 	// ConnectEx requires an overlapped socket
 	SOCKET sock = WSASocket(AF_INET, SOCK_STREAM, IPPROTO_TCP, NULL, 0, WSA_FLAG_OVERLAPPED);
@@ -206,7 +202,7 @@ SOCKET AsyncConnect(SOCKADDR* remoteAddr, int remoteAddrLen) {
 	}
 
 	// Associate with the IOCP so completions are delivered to the scheduler
-	if (CreateIoCompletionPort((HANDLE)sock, g_hIOCP, KEY_IO, 0) == NULL) {
+	if (CreateIoCompletionPort((HANDLE)sock, rt->hIOCP, KEY_IO, 0) == NULL) {
 		LOG_ERROR("CreateIoCompletionPort");
 		closesocket(sock);
 		return INVALID_SOCKET;
@@ -263,7 +259,7 @@ void WINAPI AcceptTask(LPVOID param)
 		}
 
 		// Associate the new socket with IOCP
-		CreateIoCompletionPort((HANDLE)clientSocket, g_hIOCP, KEY_IO, 0);
+		CreateIoCompletionPort((HANDLE)clientSocket, rt->hIOCP, KEY_IO, 0);
 
 		// Create and kick off a new accept task
 		LPVOID acceptFiber = CreateFiber(FIBER_STACK_SIZE, AcceptTask, rt);
@@ -273,13 +269,13 @@ void WINAPI AcceptTask(LPVOID param)
 			continue;
 		}
 
-		PostQueuedCompletionStatus(g_hIOCP, 0, KEY_START, acceptFiber);
+		PostQueuedCompletionStatus(rt->hIOCP, 0, KEY_START, acceptFiber);
 
 		// Call the handler
 		rt->fnHandleClient(clientSocket);
 
 		// Signal the scheduler that this fiber is done
-		PostQueuedCompletionStatus(g_hIOCP, 0, KEY_CLEANUP, GetCurrentFiber());
+		PostQueuedCompletionStatus(rt->hIOCP, 0, KEY_CLEANUP, GetCurrentFiber());
 
 		// this task dies
 		while (1) SwitchToFiber(tls_schedulerFiber);
@@ -363,7 +359,7 @@ BOOL LoadMSWSockExtensions(void) {
 	return TRUE;
 }
 
-void SchedulerLoop(void) {
+void SchedulerLoop(AsyncRuntime* rt) {
 
 	OVERLAPPED_ENTRY entries[BATCH_SIZE];
 	ULONG            ulNumEntries;
@@ -371,7 +367,7 @@ void SchedulerLoop(void) {
 	while (1) {
 
 		BOOL ok = GetQueuedCompletionStatusEx(
-			g_hIOCP,
+			rt->hIOCP,
 			entries,
 			BATCH_SIZE,
 			&ulNumEntries,
@@ -390,7 +386,7 @@ void SchedulerLoop(void) {
 			switch (e->lpCompletionKey) {
 
 			case KEY_SHUTDOWN:
-				PostQueuedCompletionStatus(g_hIOCP, 0, KEY_SHUTDOWN, NULL);
+				PostQueuedCompletionStatus(rt->hIOCP, 0, KEY_SHUTDOWN, NULL);
 				return;
 
 			case KEY_START:
@@ -413,11 +409,9 @@ void SchedulerLoop(void) {
 	}
 }
 
-
-
 DWORD WINAPI WorkerThread(LPVOID param) {
 
-	UNREFERENCED_PARAMETER(param);
+	AsyncRuntime* rt = (AsyncRuntime*)param;
 
 	tls_schedulerFiber = ConvertThreadToFiber(NULL);
 	if (!tls_schedulerFiber) {
@@ -425,7 +419,7 @@ DWORD WINAPI WorkerThread(LPVOID param) {
 		return 1;
 	}
 
-	SchedulerLoop();
+	SchedulerLoop(rt);
 
 	ConvertFiberToThread();
 	return 0;
@@ -447,15 +441,15 @@ int AsyncRuntimeInit(AsyncRuntime* rt)
 	}
 
 	// Creates an I/O completion port and associate the listening socket with the completion port
-	g_hIOCP = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, KEY_IO, WORKER_THREADS);
-	if (g_hIOCP == NULL) {
+	rt->hIOCP = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, KEY_IO, WORKER_THREADS);
+	if (rt->hIOCP == NULL) {
 		LOG_ERROR("CreateIoCompletionPort");
 		return 1;
 	}
 
 	// Spin up worker threads — each will convert itself to a fiber and run SchedulerLoop
 	for (DWORD i = 0; i < WORKER_THREADS; i++) {
-		rt->threads[i] = CreateThread(NULL, 0, WorkerThread, NULL, 0, NULL);
+		rt->threads[i] = CreateThread(NULL, 0, WorkerThread, rt, 0, NULL);
 		if (rt->threads[i] == NULL) {
 			LOG_ERROR("CreateThread");
 			return 1;
@@ -468,7 +462,7 @@ int AsyncRuntimeInit(AsyncRuntime* rt)
 
 void AsyncRuntimeShutdown(AsyncRuntime* rt) 
 {
-	PostQueuedCompletionStatus(g_hIOCP, 0, KEY_SHUTDOWN, NULL);
+	PostQueuedCompletionStatus(rt->hIOCP, 0, KEY_SHUTDOWN, NULL);
 }
 
 void AsyncRuntimeAwait(AsyncRuntime* rt)
@@ -485,12 +479,12 @@ void AsyncRuntimeCleanup(AsyncRuntime* rt) {
 	}
 
 	// Clean up
-	CloseHandle(g_hIOCP);
+	CloseHandle(rt->hIOCP);
 	closesocket(rt->listenSocket);
 	WSACleanup();
 }
 
-int AsyncRuntimeListen(AsyncRuntime* rt, CHAR* addr, HandleClientFn handleClient)
+int AsyncRuntimeListen(AsyncRuntime* rt, const WCHAR* host, USHORT port, HandleClientFn handleClient)
 {
 	rt->fnHandleClient = handleClient;
 
@@ -505,11 +499,21 @@ int AsyncRuntimeListen(AsyncRuntime* rt, CHAR* addr, HandleClientFn handleClient
 	BOOL yes = TRUE;
 	setsockopt(rt->listenSocket, SOL_SOCKET, SO_REUSEADDR, (char*)&yes, sizeof(yes));
 
-	SOCKADDR_IN serverAddr = { 0 };
-	serverAddr.sin_family = AF_INET;
-	serverAddr.sin_port = htons((USHORT)LISTEN_PORT);
-	serverAddr.sin_addr.s_addr = INADDR_ANY;
+	SOCKADDR_IN serverAddr = {
+		.sin_family = AF_INET,
+		.sin_port = htons(port),
+	};
 
+	int ret = InetPtonW(AF_INET, host, &serverAddr.sin_addr);
+	if (ret == 0) {
+		LOG_ERROR_CODE("InetPtonW", ret);
+		return 1;
+	}
+	else if (ret == -1) {
+		LOG_ERROR("InetPtonW");
+		return 1;
+	}
+	
 	// Associates a local address with a socket
 	if (bind(rt->listenSocket, (SOCKADDR*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR) {
 		LOG_ERROR("bind");
@@ -523,7 +527,7 @@ int AsyncRuntimeListen(AsyncRuntime* rt, CHAR* addr, HandleClientFn handleClient
 	}
 
 	// Creates an I/O completion port and associate the listening socket with the completion port
-	CreateIoCompletionPort((HANDLE)rt->listenSocket, g_hIOCP, KEY_IO, 0);
+	CreateIoCompletionPort((HANDLE)rt->listenSocket, rt->hIOCP, KEY_IO, 0);
 	
 
 	// Create and kick off the accept fiber
@@ -533,7 +537,7 @@ int AsyncRuntimeListen(AsyncRuntime* rt, CHAR* addr, HandleClientFn handleClient
 		return 1;
 	}
 
-	PostQueuedCompletionStatus(g_hIOCP, 0, KEY_START, acceptFiber);
+	PostQueuedCompletionStatus(rt->hIOCP, 0, KEY_START, acceptFiber);
 
-
+	return 0;
 }
