@@ -11,8 +11,6 @@
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "ntdll.lib")
 
-#define ArraySize(x) (sizeof x / sizeof x[0])
-
 #define BATCH_SIZE      64
 #define WORKER_THREADS  4
 

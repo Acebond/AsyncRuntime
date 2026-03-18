@@ -51,6 +51,7 @@ int main(void) {
 	// Calls AsyncRuntimeShutdown on Ctrl-C
 	SetConsoleCtrlHandler(CtrlHandler, TRUE);
 
+	// Waits until AsyncRuntimeShutdown is called 
 	AsyncRuntimeAwait(&rt);
 
 	printf("Shutting down\n");
