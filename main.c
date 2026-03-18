@@ -380,7 +380,6 @@ DWORD WINAPI WorkerThread(LPVOID param) {
 
 	UNREFERENCED_PARAMETER(param);
 
-	// Each worker thread must become a fiber before it can use fibers
 	tls_schedulerFiber = ConvertThreadToFiber(NULL);
 	if (!tls_schedulerFiber) {
 		LOG_ERROR("ConvertThreadToFiber");
@@ -440,7 +439,7 @@ int main(void) {
 
 	// Creates an I/O completion port and associate the listening socket with the completion port
 	// NumberOfConcurrentThreads = 1 (for now)
-	g_hIOCP = CreateIoCompletionPort((HANDLE)listenSocket, NULL, 0, 1);
+	g_hIOCP = CreateIoCompletionPort((HANDLE)listenSocket, NULL, KEY_IO, WORKER_THREADS);
 	if (g_hIOCP == NULL) {
 		LOG_ERROR("CreateIoCompletionPort");
 		return 1;
@@ -451,21 +450,13 @@ int main(void) {
 
 	for (DWORD i = 0; i < WORKER_THREADS; i++) {
 		threads[i] = CreateThread(NULL, 0, WorkerThread, NULL, 0, NULL);
-		if (!threads[i]) {
+		if (threads[i] == NULL) {
 			LOG_ERROR("CreateThread");
 			return 1;
 		}
 	}
 
-	// Convert main thread to a fiber (required before using fibers)
-	//tls_schedulerFiber = ConvertThreadToFiber(NULL);
-	//if (!tls_schedulerFiber) {
-	//	LOG_ERROR("ConvertThreadToFiber");
-	//	return 1;
-	//}
-
 	// Create and kick off the accept fiber
-	// It will call AsyncAccept, which suspends immediately back here
 	LPVOID acceptFiber = CreateFiber(FIBER_STACK_SIZE, AcceptLoop, (LPVOID)listenSocket);
 	if (!acceptFiber) {
 		LOG_ERROR("CreateFiber");
@@ -478,19 +469,15 @@ int main(void) {
 
 	WaitForMultipleObjects(WORKER_THREADS, threads, TRUE, INFINITE);
 
-	//SchedulerLoop();
-
 	printf("Shutting down\n");
 
 	for (DWORD i = 0; i < WORKER_THREADS; i++) {
 		CloseHandle(threads[i]);
 	}
 
-
 	// Clean up
 	CloseHandle(g_hIOCP);
 	closesocket(listenSocket);
 	WSACleanup();
-	//ConvertFiberToThread();
 	return 0;
 }
